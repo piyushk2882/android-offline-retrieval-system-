@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+open_clip_torch
+torch
+pillow
+sentence-transformers
+pymupdf
+python-docx
+python-pptx
+numpy
