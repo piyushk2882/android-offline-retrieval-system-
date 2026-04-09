@@ -5,6 +5,7 @@ import 'package:semantic_memory_frontend/screens/image_viewer.dart';
 import 'package:semantic_memory_frontend/screens/splash_screen.dart';
 import 'package:semantic_memory_frontend/services/api_service.dart';
 import 'package:semantic_memory_frontend/services/fast_search.dart';
+import 'package:semantic_memory_frontend/services/voice_service.dart';
 import 'package:semantic_memory_frontend/theme/app_theme.dart';
 
 import 'dart:io';
@@ -15,6 +16,45 @@ import 'services/document_indexing_service.dart';
 import 'database/database_helper.dart';
 import 'services/index_loader.dart';
 import 'services/camera_service.dart';
+import 'services/query_processor.dart';
+
+// ── Intent Detection ──────────────────────────────────────────────
+class QueryIntent {
+  bool isImage = false;
+  bool isDocument = false;
+
+  QueryIntent(String query) {
+    if (query.contains("image") ||
+        query.contains("photo") ||
+        query.contains("picture")) {
+      isImage = true;
+    }
+
+    if (query.contains("pdf") ||
+        query.contains("notes") ||
+        query.contains("document") ||
+        query.contains("ppt") ||
+        query.contains("question")) {
+      isDocument = true;
+    }
+  }
+}
+
+// ── Year Filter ────────────────────────────────────────────────────
+List filterByYear(List results, int year) {
+  return results.where((item) {
+    final file = File(item["path"] as String);
+    final modified = file.lastModifiedSync();
+    return modified.year == year;
+  }).toList();
+}
+
+/// Extracts the first 4-digit year (1900-2099) found in [query], or null.
+int? extractYear(String query) {
+  final match = RegExp(r'\b(19|20)\d{2}\b').firstMatch(query);
+  if (match == null) return null;
+  return int.tryParse(match.group(0)!);
+}
 
 void main() {
   runApp(const MyApp());
@@ -54,6 +94,11 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
   late AnimationController _typewriterController;
   late Animation<int> _typewriterAnimation;
   final String _typewriterText = "What can I find for you?";
+
+  // Indexing progress
+  int _indexingProgress = 0;
+  int _indexingTotal = 0;
+  bool get _isIndexing => _indexingTotal > 0 && _indexingProgress < _indexingTotal;
 
   @override
   void initState() {
@@ -102,7 +147,19 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
     });
 
     if (files.isNotEmpty) {
-      await startIndexing(files);
+      await startIndexing(
+        files,
+        onProgress: (indexed, total) {
+          setState(() {
+            _indexingProgress = indexed;
+            _indexingTotal = total;
+          });
+        },
+      );
+      // Mark complete
+      setState(() {
+        _indexingProgress = _indexingTotal;
+      });
     }
 
     var rows = await DatabaseHelper.instance.getAllEmbeddings();
@@ -111,33 +168,62 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
 
   Future<void> startup() async {
     await loadIndex();
-    scanImages();
-    startDocumentIndexing();
+    // Await images first so document indexing doesn't race
+    await scanImages();
+
+    // Need full-storage permission to read Downloads / Documents folders
+    final storageGranted = await PermissionService.requestStoragePermission();
+    if (!storageGranted) {
+      print("[Document] Storage permission denied — skipping document scan");
+      return;
+    }
+
+    await startDocumentIndexing();
   }
 
-  Future<void> _performSearch(String query) async {
-    if (query.trim().isEmpty) return;
+  // ── Smart Search Pipeline ─────────────────────────────────────
+  Future<void> handleSearch(String rawQuery) async {
+    if (rawQuery.trim().isEmpty) return;
+
+    String query = processQuery(rawQuery);
+    print("Processed Query: $query");
 
     setState(() {
       _isSearching = true;
       _searchedOnce = true;
+      _searchController.text = rawQuery;
     });
+
+    var intent = QueryIntent(query);
 
     List imageResults = [];
     List docResults = [];
 
-    if (_searchFilter != "documents") {
-      var imageEmbedding = await ApiService.embedText(query);
-      if (imageEmbedding != null) {
-        imageResults = await fastSearch(imageEmbedding);
+    // Respect manual filter chips; otherwise use intent to skip irrelevant searches
+    final bool skipImages =
+        _searchFilter == "documents" || intent.isDocument && !intent.isImage;
+    final bool skipDocs =
+        _searchFilter == "images" || intent.isImage && !intent.isDocument;
+
+    if (!skipImages) {
+      var clipEmbedding = await ApiService.embedText(query);
+      if (clipEmbedding != null) {
+        imageResults = await fastSearch(clipEmbedding);
       }
     }
 
-    if (_searchFilter != "images") {
+    if (!skipDocs) {
       var docEmbedding = await ApiService.embedTextDoc(query);
       if (docEmbedding != null) {
         docResults = searchDocuments(docEmbedding, query);
       }
+    }
+
+    // Apply dynamic year filter if a year is mentioned in the query
+    final int? year = extractYear(query);
+    if (year != null) {
+      imageResults = filterByYear(imageResults, year);
+      docResults = filterByYear(docResults, year);
     }
 
     setState(() {
@@ -146,6 +232,9 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
       _isSearching = false;
     });
   }
+
+  // Keep _performSearch as an alias so onSubmitted still works
+  Future<void> _performSearch(String query) => handleSearch(query);
 
   IconData _getDocIcon(String path) {
     String p = path.toLowerCase();
@@ -224,6 +313,7 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
       children: [
         const SizedBox(height: 12),
         _buildSearchBar(),
+        if (_isIndexing) _buildIndexingProgressBar(),
         const SizedBox(height: 6),
         _buildFilterChips(),
         const SizedBox(height: 4),
@@ -262,8 +352,10 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
           ),
           const SizedBox(height: 24),
           _buildSearchBar(),
-          const SizedBox(height: 16),
-          if (files.isEmpty) _buildScanningIndicator(),
+          if (_isIndexing)
+            _buildIndexingProgressBar()
+          else if (files.isEmpty)
+            _buildScanningIndicator(),
         ],
       ),
     );
@@ -347,6 +439,16 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
                 documentSearchResults = [];
                 _isSearching = false;
               });
+            },
+          ),
+
+          IconButton(
+            icon: const Icon(Icons.mic),
+            onPressed: () async {
+              final String? text = await VoiceService.listen();
+              if (text == null || text.trim().isEmpty) return;
+              print("Voice Query: $text");
+              await handleSearch(text);
             },
           ),
         ],
@@ -501,6 +603,38 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
               fontSize: 15,
               color: AppColors.textSecondary,
               fontWeight: FontWeight.w500,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildIndexingProgressBar() {
+    final double frac = _indexingTotal > 0
+        ? (_indexingProgress / _indexingTotal).clamp(0.0, 1.0)
+        : 0.0;
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          ClipRRect(
+            borderRadius: BorderRadius.circular(4),
+            child: LinearProgressIndicator(
+              value: frac,
+              minHeight: 4,
+              backgroundColor: AppColors.primary.withValues(alpha: 0.15),
+              valueColor:
+                  AlwaysStoppedAnimation<Color>(AppColors.primary),
+            ),
+          ),
+          const SizedBox(height: 4),
+          Text(
+            "Indexing images… $_indexingProgress / $_indexingTotal",
+            style: GoogleFonts.inter(
+              fontSize: 11,
+              color: AppColors.textHint,
             ),
           ),
         ],

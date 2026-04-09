@@ -3,7 +3,7 @@ import 'dart:io';
 import 'package:http/http.dart' as http;
 
 class ApiService {
-  static const baseUrl = "http://10.93.150.7:8000";
+  static const baseUrl = "http://172.16.57.182:8000";
 
   static Future<List<double>?> embedImage(File file) async {
     try {
