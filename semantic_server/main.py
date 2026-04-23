@@ -32,6 +32,50 @@ app = FastAPI()
 UPLOAD_DIR = "temp_files"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
+import threading
+
+wake_triggered = False
+
+def wake_listener():
+    global wake_triggered
+    try:
+        from openwakeword.model import Model
+        import pyaudio
+        import numpy as np
+
+        model = Model(wakeword_models=["hey_jarvis"])
+
+        audio = pyaudio.PyAudio()
+        stream = audio.open(
+            format=pyaudio.paInt16,
+            channels=1,
+            rate=16000,
+            input=True,
+            frames_per_buffer=1280
+        )
+        print("Live wake word listener running... (say 'hey jarvis')")
+        
+        while True:
+            data = stream.read(1280, exception_on_overflow=False)
+            audio_np = np.frombuffer(data, dtype=np.int16)
+            pred = model.predict(audio_np)
+            if pred.get("hey_jarvis", 0) > 0.5:
+                wake_triggered = True
+    except Exception as e:
+        print(f"Failed to start wake listener: {e}")
+
+@app.on_event("startup")
+def start_listener():
+    threading.Thread(target=wake_listener, daemon=True).start()
+
+@app.get("/wake_status")
+def get_wake_status():
+    global wake_triggered
+    if wake_triggered:
+        wake_triggered = False
+        return {"wake": True}
+    return {"wake": False}
+
 @app.get("/health")
 def health_check():
     return {"status": "server running"}
@@ -107,6 +151,9 @@ async def embed_document(file: UploadFile = File(...)):
             "chunks": chunks,
             "embeddings": embeddings.tolist()
         }
+    except Exception as e:
+        print(f"Error processing document {filename}: {e}")
+        return {"chunks": [], "embeddings": []}
     finally:
         if os.path.exists(temp_path):
             os.remove(temp_path)
@@ -124,12 +171,17 @@ async def embed_images_batch(files: List[UploadFile] = File(...)):
         with open(path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
 
-        embedding = generate_image_embedding(path)
+        try:
+            embedding = generate_image_embedding(path)
 
-        embedding = embedding.astype("float16")
+            embedding = embedding.astype("float16")
 
-        embeddings.append(embedding.tolist())
-
-        os.remove(path)
+            embeddings.append(embedding.tolist())
+        except Exception as e:
+            print(f"Error processing image {file.filename}: {e}")
+            embeddings.append([0.0] * 512)
+        finally:
+            if os.path.exists(path):
+                os.remove(path)
 
     return {"embeddings": embeddings}

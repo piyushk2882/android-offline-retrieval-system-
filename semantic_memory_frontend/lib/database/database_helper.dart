@@ -76,6 +76,33 @@ class DatabaseHelper {
     return await db.query("embeddings");
   }
 
+  /// Lean query — returns ONLY file_path column from the image index.
+  /// Never fetches the embedding column, preventing OOM when listing images.
+  Future<List<String>> getAllImagePaths() async {
+    final db = await instance.database;
+    final rows = await db.rawQuery('SELECT file_path FROM embeddings');
+    return rows.map((r) => r['file_path'] as String).toList();
+  }
+
+  /// Lean query — returns one row per unique document (file_path + first chunk_text).
+  /// Never fetches the embedding column, preventing OOM when listing documents.
+  Future<List<Map<String, dynamic>>> getDistinctDocumentPaths() async {
+    final db = await instance.database;
+    final rows = await db.rawQuery('''
+      SELECT file_path, chunk_text
+      FROM document_embeddings
+      WHERE chunk_index = 0
+      GROUP BY file_path
+      ORDER BY file_path ASC
+    ''');
+    return rows
+        .map((r) => {
+              'path': r['file_path'] as String,
+              'chunk': r['chunk_text'] as String? ?? '',
+            })
+        .toList();
+  }
+
   Future<void> insertEmbedding(String path, List<double> embedding) async {
 
     final db = await instance.database;
@@ -158,5 +185,107 @@ class DatabaseHelper {
   Future<void> clearDocumentEmbeddings() async {
     final db = await instance.database;
     await db.delete("document_embeddings");
+  }
+
+  Future<void> deleteEmbeddingByPath(String path) async {
+    final db = await instance.database;
+    await db.delete(
+      "embeddings",
+      where: "file_path = ?",
+      whereArgs: [path],
+    );
+  }
+
+  Future<void> deleteDocumentEmbeddingByPath(String path) async {
+    final db = await instance.database;
+    await db.delete(
+      "document_embeddings",
+      where: "file_path = ?",
+      whereArgs: [path],
+    );
+  }
+
+  /// Keyword-based fallback: searches chunk_text and file_path using SQL LIKE.
+  /// Used when the in-memory vector index hasn't finished loading yet.
+  Future<List<Map<String, dynamic>>> searchDocumentsByKeyword(
+    String query, {
+    int limit = 10,
+  }) async {
+    final db = await instance.database;
+    final words = query
+        .toLowerCase()
+        .split(RegExp(r'\s+'))
+        .where((w) => w.length > 2)
+        .toList();
+
+    if (words.isEmpty) return [];
+
+    // Build a WHERE clause that ANDs all non-trivial words
+    final conditions =
+        words.map((_) => '(LOWER(chunk_text) LIKE ? OR LOWER(file_path) LIKE ?)').join(' AND ');
+    final args = words.expand((w) => ['%$w%', '%$w%']).toList();
+
+    final rows = await db.rawQuery(
+      '''
+      SELECT file_path, chunk_text
+      FROM document_embeddings
+      WHERE chunk_index != -1 AND $conditions
+      LIMIT $limit
+      ''',
+      args,
+    );
+
+    // Deduplicate by file_path, keeping the first (highest-rank) chunk
+    final Map<String, Map<String, dynamic>> deduped = {};
+    for (final row in rows) {
+      final path = row['file_path'] as String;
+      if (!deduped.containsKey(path)) {
+        deduped[path] = {
+          'path': path,
+          'chunk': row['chunk_text'] as String,
+          'score': 0.0,
+          'type': 'document',
+          'isKeywordResult': true,
+        };
+      }
+    }
+    return deduped.values.toList();
+  }
+
+  /// Path-based fallback: finds indexed images whose file path contains any query word.
+  Future<List<Map<String, dynamic>>> searchImagesByPath(
+    String query, {
+    int limit = 10,
+  }) async {
+    final db = await instance.database;
+    final words = query
+        .toLowerCase()
+        .split(RegExp(r'\s+'))
+        .where((w) => w.length > 2)
+        .toList();
+
+    if (words.isEmpty) return [];
+
+    final conditions = words.map((_) => 'LOWER(file_path) LIKE ?').join(' OR ');
+    final args = words.map((w) => '%$w%').toList();
+
+    final rows = await db.rawQuery(
+      '''
+      SELECT file_path
+      FROM embeddings
+      WHERE $conditions
+      LIMIT $limit
+      ''',
+      args,
+    );
+
+    return rows
+        .map((r) => {
+              'path': r['file_path'] as String,
+              'score': 0.0,
+              'type': 'image',
+              'isKeywordResult': true,
+            })
+        .toList();
   }
 }

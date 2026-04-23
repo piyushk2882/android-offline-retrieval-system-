@@ -49,6 +49,7 @@ dependencies:
   google_fonts: ^6.2.1
   video_player: ^2.8.2
   speech_to_text: ^7.3.0
+  home_widget: ^0.9.1
 
 dev_dependencies:
   flutter_test:

@@ -1,7 +1,9 @@
 import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:semantic_memory_frontend/screens/document_viewer.dart';
+import 'package:semantic_memory_frontend/screens/documents_screen.dart';
 import 'package:semantic_memory_frontend/screens/image_viewer.dart';
+import 'package:semantic_memory_frontend/screens/images_screen.dart';
 import 'package:semantic_memory_frontend/screens/splash_screen.dart';
 import 'package:semantic_memory_frontend/services/api_service.dart';
 import 'package:semantic_memory_frontend/services/fast_search.dart';
@@ -9,6 +11,11 @@ import 'package:semantic_memory_frontend/services/voice_service.dart';
 import 'package:semantic_memory_frontend/theme/app_theme.dart';
 
 import 'dart:io';
+import 'dart:async';
+import 'dart:convert';
+import 'package:http/http.dart' as http;
+import 'package:home_widget/home_widget.dart';
+import 'package:semantic_memory_frontend/screens/assistant_overlay_screen.dart';
 import 'services/media_scanner.dart';
 import 'services/permission_service.dart';
 import 'services/indexing_service.dart';
@@ -56,26 +63,44 @@ int? extractYear(String query) {
   return int.tryParse(match.group(0)!);
 }
 
-void main() {
-  runApp(const MyApp());
+
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  
+  bool launchedFromWidget = false;
+  try {
+    var uri = await HomeWidget.initiallyLaunchedFromHomeWidget();
+    if (uri != null) {
+      launchedFromWidget = true;
+    }
+  } catch (e) {
+    print("HomeWidget Error: $e");
+  }
+
+  runApp(MyApp(launchedFromWidget: launchedFromWidget));
 }
 
 class MyApp extends StatelessWidget {
-  const MyApp({super.key});
+  final bool launchedFromWidget;
+  const MyApp({super.key, this.launchedFromWidget = false});
 
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
       title: 'MemoryLens',
       debugShowCheckedModeBanner: false,
-      theme: buildAppTheme(),
-      home: const SplashScreen(),
+      theme: buildAppTheme().copyWith(
+        scaffoldBackgroundColor: launchedFromWidget ? Colors.transparent : null,
+      ),
+      home: launchedFromWidget ? const AssistantOverlayScreen() : const SplashScreen(),
     );
   }
 }
 
+
 class HomeScreen extends StatefulWidget {
-  const HomeScreen({super.key});
+  final String? initialQuery;
+  const HomeScreen({super.key, this.initialQuery});
 
   @override
   State<HomeScreen> createState() => _HomeScreenState();
@@ -88,6 +113,8 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
   String _searchFilter = "all"; // "all", "documents", "images"
   bool _isSearching = false;
   bool _searchedOnce = false;
+  // True once the first batch of vectors is loaded into memory
+  bool _indexReady = false;
   final TextEditingController _searchController = TextEditingController();
   late AnimationController _pulseController;
   late Animation<double> _pulseAnimation;
@@ -121,6 +148,12 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
         );
     _typewriterController.forward();
     startup();
+
+    if (widget.initialQuery != null) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        handleSearch(widget.initialQuery!);
+      });
+    }
   }
 
   @override
@@ -129,6 +162,74 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
     _typewriterController.dispose();
     _searchController.dispose();
     super.dispose();
+  }
+
+
+
+  void showAssistantPopup() async {
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: Colors.transparent,
+      builder: (context) => _buildAssistantPopup(),
+    );
+
+    String? query = await VoiceService.listen();
+    if (context.mounted) {
+      Navigator.pop(context);
+    }
+    
+    if (query != null && query.trim().isNotEmpty) {
+      handleSearch(query);
+    }
+  }
+
+  Widget _buildAssistantPopup() {
+    return Container(
+      decoration: BoxDecoration(
+        color: AppColors.surface,
+        borderRadius: const BorderRadius.vertical(top: Radius.circular(24)),
+      ),
+      padding: const EdgeInsets.all(24),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Container(
+            width: 48,
+            height: 4,
+            decoration: BoxDecoration(
+              color: AppColors.tertiary.withValues(alpha: 0.3),
+              borderRadius: BorderRadius.circular(2),
+            ),
+          ),
+          const SizedBox(height: 24),
+          AnimatedBuilder(
+            animation: _pulseAnimation,
+            builder: (_, child) => Transform.scale(
+              scale: _pulseAnimation.value,
+              child: child,
+            ),
+            child: Container(
+              padding: const EdgeInsets.all(16),
+              decoration: BoxDecoration(
+                color: AppColors.primary.withValues(alpha: 0.1),
+                shape: BoxShape.circle,
+              ),
+              child: const Icon(Icons.mic, size: 48, color: AppColors.primary),
+            ),
+          ),
+          const SizedBox(height: 24),
+          Text(
+            "Listening...",
+            style: GoogleFonts.inter(
+              fontSize: 20,
+              fontWeight: FontWeight.w600,
+              color: AppColors.textPrimary,
+            ),
+          ),
+          const SizedBox(height: 32),
+        ],
+      ),
+    );
   }
 
   Future<void> scanImages() async {
@@ -167,18 +268,28 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
   }
 
   Future<void> startup() async {
-    await loadIndex();
-    // Await images first so document indexing doesn't race
-    await scanImages();
+    // ── Phase 1: load vectors in background (non-blocking) ──────────────
+    // Search via DB keyword fallback is available immediately.
+    // Vector search unlocks as soon as the first batch is in memory.
+    loadIndex(
+      onEarlyReady: () {
+        if (mounted) setState(() => _indexReady = true);
+      },
+    ).then((_) {
+      if (mounted) setState(() => _indexReady = true);
+    });
 
-    // Need full-storage permission to read Downloads / Documents folders
+    // ── Phase 2: scan + index new files (images & docs in parallel) ──────
     final storageGranted = await PermissionService.requestStoragePermission();
-    if (!storageGranted) {
-      print("[Document] Storage permission denied — skipping document scan");
-      return;
-    }
 
-    await startDocumentIndexing();
+    await Future.wait([
+      scanImages(),
+      if (storageGranted)
+        startDocumentIndexing()
+      else
+        Future(() =>
+            print("[Document] Storage permission denied — skipping doc scan")),
+    ]);
   }
 
   // ── Smart Search Pipeline ─────────────────────────────────────
@@ -205,17 +316,30 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
     final bool skipDocs =
         _searchFilter == "images" || intent.isImage && !intent.isDocument;
 
-    if (!skipImages) {
-      var clipEmbedding = await ApiService.embedText(query);
-      if (clipEmbedding != null) {
-        imageResults = await fastSearch(clipEmbedding);
+    if (_indexReady) {
+      // ── Full vector search ──────────────────────────────────────
+      if (!skipImages) {
+        var clipEmbedding = await ApiService.embedText(query);
+        if (clipEmbedding != null) {
+          imageResults = await fastSearch(clipEmbedding);
+        }
       }
-    }
-
-    if (!skipDocs) {
-      var docEmbedding = await ApiService.embedTextDoc(query);
-      if (docEmbedding != null) {
-        docResults = searchDocuments(docEmbedding, query);
+      if (!skipDocs) {
+        var docEmbedding = await ApiService.embedTextDoc(query);
+        if (docEmbedding != null) {
+          docResults = searchDocuments(docEmbedding, query);
+        }
+      }
+    } else {
+      // ── DB keyword fallback (index still loading) ───────────────
+      print("[Search] Vector index not ready — using keyword fallback");
+      if (!skipDocs) {
+        docResults =
+            await DatabaseHelper.instance.searchDocumentsByKeyword(query);
+      }
+      if (!skipImages) {
+        imageResults =
+            await DatabaseHelper.instance.searchImagesByPath(query);
       }
     }
 
@@ -274,6 +398,7 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
+      backgroundColor: AppColors.neutral,
       body: SafeArea(
         child: Column(
           children: [
@@ -314,6 +439,7 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
         const SizedBox(height: 12),
         _buildSearchBar(),
         if (_isIndexing) _buildIndexingProgressBar(),
+        if (!_indexReady) _buildIndexLoadingBanner(),
         const SizedBox(height: 6),
         _buildFilterChips(),
         const SizedBox(height: 4),
@@ -329,20 +455,21 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
   }
 
   Widget _buildCenteredSearchLayout({Key? key}) {
-    return Padding(
+    return SingleChildScrollView(
       key: key,
-      padding: const EdgeInsets.symmetric(horizontal: 16),
+      padding: const EdgeInsets.fromLTRB(16, 20, 16, 24),
       child: Column(
-        mainAxisAlignment: MainAxisAlignment.center,
+        crossAxisAlignment: CrossAxisAlignment.start,
         children: [
+          // ── Greeting + typewriter ─────────────────────────────
           AnimatedBuilder(
             animation: _typewriterAnimation,
             builder: (context, child) {
               return Text(
                 _typewriterText.substring(0, _typewriterAnimation.value),
-                textAlign: TextAlign.center,
+                textAlign: TextAlign.start,
                 style: GoogleFonts.inter(
-                  fontSize: 24,
+                  fontSize: 26,
                   fontWeight: FontWeight.w700,
                   color: AppColors.textPrimary,
                   letterSpacing: -0.5,
@@ -350,13 +477,200 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
               );
             },
           ),
-          const SizedBox(height: 24),
+          const SizedBox(height: 4),
+          Text(
+            'Search across all your indexed content',
+            style: GoogleFonts.inter(
+              fontSize: 13,
+              color: AppColors.textHint,
+            ),
+          ),
+          const SizedBox(height: 20),
+
+          // ── Global search bar (docs + images) ─────────────────
           _buildSearchBar(),
+          if (!_indexReady) _buildIndexLoadingBanner(),
           if (_isIndexing)
             _buildIndexingProgressBar()
           else if (files.isEmpty)
             _buildScanningIndicator(),
+
+          const SizedBox(height: 28),
+
+          // ── Section label ─────────────────────────────────────
+          Text(
+            'Browse',
+            style: GoogleFonts.inter(
+              fontSize: 13,
+              fontWeight: FontWeight.w600,
+              color: AppColors.textHint,
+              letterSpacing: 0.8,
+            ),
+          ),
+          const SizedBox(height: 12),
+
+          // ── Documents block ───────────────────────────────────
+          _buildSectionBlock(
+            title: 'Documents',
+            subtitle: 'PDFs, slides, notes & more',
+            icon: Icons.description_rounded,
+            gradient: const LinearGradient(
+              colors: [Color(0xFF1565C0), Color(0xFF42A5F5)],
+              begin: Alignment.topLeft,
+              end: Alignment.bottomRight,
+            ),
+            accentColor: AppColors.docBlue,
+            onTap: () => Navigator.push(
+              context,
+              MaterialPageRoute(builder: (_) => const DocumentsScreen()),
+            ),
+            badgeIcon: Icons.picture_as_pdf,
+            extras: [
+              _miniTypeBadge('PDF', AppColors.pdfRed),
+              const SizedBox(width: 6),
+              _miniTypeBadge('PPT', AppColors.pptOrange),
+              const SizedBox(width: 6),
+              _miniTypeBadge('DOC', AppColors.docBlue),
+              const SizedBox(width: 6),
+              _miniTypeBadge('TXT', AppColors.txtGreen),
+            ],
+          ),
+
+          const SizedBox(height: 14),
+
+          // ── Images block ──────────────────────────────────────
+          _buildSectionBlock(
+            title: 'Images',
+            subtitle: 'Photos, screenshots & artwork',
+            icon: Icons.image_rounded,
+            gradient: const LinearGradient(
+              colors: [Color(0xFF6A1B9A), Color(0xFFAB47BC)],
+              begin: Alignment.topLeft,
+              end: Alignment.bottomRight,
+            ),
+            accentColor: AppColors.imgPurple,
+            onTap: () => Navigator.push(
+              context,
+              MaterialPageRoute(builder: (_) => const ImagesScreen()),
+            ),
+            badgeIcon: Icons.photo_library_rounded,
+            extras: [
+              _miniTypeBadge('JPG', AppColors.imgPurple),
+              const SizedBox(width: 6),
+              _miniTypeBadge('PNG', const Color(0xFF7C4DFF)),
+              const SizedBox(width: 6),
+              _miniTypeBadge('GIF', const Color(0xFF26C6DA)),
+            ],
+          ),
         ],
+      ),
+    );
+  }
+
+  Widget _buildSectionBlock({
+    required String title,
+    required String subtitle,
+    required IconData icon,
+    required LinearGradient gradient,
+    required Color accentColor,
+    required VoidCallback onTap,
+    required IconData badgeIcon,
+    List<Widget> extras = const [],
+  }) {
+    return Material(
+      color: Colors.transparent,
+      child: InkWell(
+        borderRadius: BorderRadius.circular(20),
+        onTap: onTap,
+        child: Ink(
+          decoration: BoxDecoration(
+            color: AppColors.surface,
+            borderRadius: BorderRadius.circular(20),
+            border: Border.all(
+              color: accentColor.withValues(alpha: 0.2),
+            ),
+          ),
+          child: Padding(
+            padding: const EdgeInsets.all(18),
+            child: Row(
+              children: [
+                // Left accent icon
+                Container(
+                  width: 56,
+                  height: 56,
+                  decoration: BoxDecoration(
+                    gradient: gradient,
+                    borderRadius: BorderRadius.circular(16),
+                    boxShadow: [
+                      BoxShadow(
+                        color: accentColor.withValues(alpha: 0.35),
+                        blurRadius: 12,
+                        offset: const Offset(0, 4),
+                      ),
+                    ],
+                  ),
+                  child: Icon(icon, color: Colors.white, size: 28),
+                ),
+                const SizedBox(width: 16),
+
+                // Title + badges
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        title,
+                        style: GoogleFonts.inter(
+                          fontSize: 17,
+                          fontWeight: FontWeight.w700,
+                          color: AppColors.textPrimary,
+                        ),
+                      ),
+                      const SizedBox(height: 3),
+                      Text(
+                        subtitle,
+                        style: GoogleFonts.inter(
+                          fontSize: 12,
+                          color: AppColors.textHint,
+                        ),
+                      ),
+                      if (extras.isNotEmpty) ...[  
+                        const SizedBox(height: 10),
+                        Row(children: extras),
+                      ],
+                    ],
+                  ),
+                ),
+
+                // Chevron
+                Icon(
+                  Icons.chevron_right_rounded,
+                  color: accentColor.withValues(alpha: 0.7),
+                  size: 24,
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _miniTypeBadge(String label, Color color) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 3),
+      decoration: BoxDecoration(
+        color: color.withValues(alpha: 0.15),
+        borderRadius: BorderRadius.circular(6),
+        border: Border.all(color: color.withValues(alpha: 0.3)),
+      ),
+      child: Text(
+        label,
+        style: GoogleFonts.inter(
+          fontSize: 10,
+          fontWeight: FontWeight.w700,
+          color: color,
+        ),
       ),
     );
   }
@@ -438,7 +752,9 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
                 imageSearchResults = imageResults;
                 documentSearchResults = [];
                 _isSearching = false;
+                _searchedOnce = true; // switch to results layout
               });
+              _searchController.text = "📷 Image search results";
             },
           ),
 
@@ -638,6 +954,48 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
             ),
           ),
         ],
+      ),
+    );
+  }
+
+  /// Subtle banner shown while the in-memory vector index is still loading.
+  Widget _buildIndexLoadingBanner() {
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+      child: AnimatedOpacity(
+        opacity: _indexReady ? 0.0 : 1.0,
+        duration: const Duration(milliseconds: 600),
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 7),
+          decoration: BoxDecoration(
+            color: AppColors.primary.withValues(alpha: 0.08),
+            borderRadius: BorderRadius.circular(10),
+            border:
+                Border.all(color: AppColors.primary.withValues(alpha: 0.18)),
+          ),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              SizedBox(
+                width: 12,
+                height: 12,
+                child: CircularProgressIndicator(
+                  strokeWidth: 1.8,
+                  color: AppColors.primary,
+                ),
+              ),
+              const SizedBox(width: 8),
+              Text(
+                "Building vector index… keyword search active",
+                style: GoogleFonts.inter(
+                  fontSize: 11,
+                  color: AppColors.primary,
+                  fontWeight: FontWeight.w500,
+                ),
+              ),
+            ],
+          ),
+        ),
       ),
     );
   }
@@ -868,7 +1226,17 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
               child: Stack(
                 fit: StackFit.expand,
                 children: [
-                  Image.file(File(img["path"]), fit: BoxFit.cover),
+                  Image.file(
+                    File(img["path"]),
+                    fit: BoxFit.cover,
+                    errorBuilder: (context, error, stackTrace) {
+                      return Container(
+                        color: AppColors.surfaceLight,
+                        alignment: Alignment.center,
+                        child: const Icon(Icons.broken_image, color: AppColors.textHint),
+                      );
+                    },
+                  ),
                   // Bottom gradient overlay for filename
                   Positioned(
                     left: 0,

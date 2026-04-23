@@ -109,6 +109,16 @@ Future<void> processDocumentBatch(List<File> batch) async {
     final List chunks = response["chunks"];
     final List embeddings = response["embeddings"];
 
+    if (chunks.isEmpty) {
+      await DatabaseHelper.instance.insertDocumentEmbedding(
+        file.path,
+        "",
+        [],
+        -1,
+      );
+      continue;
+    }
+
     for (int i = 0; i < chunks.length; i++) {
       await DatabaseHelper.instance.insertDocumentEmbedding(
         file.path,
